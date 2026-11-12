@@ -1,21 +1,61 @@
-name: grab-cdx
-on:
-  push:
+name: grab-site
+on: [push, workflow_dispatch]
 jobs:
   grab:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch CDX index of zplusdesign.com
+      - name: Fetch CDX + all html snapshots
         run: |
           curl -s --max-time 300 "https://web.archive.org/cdx/search/cdx?url=zplusdesign.com&matchType=domain&fl=original,timestamp,statuscode,mimetype&collapse=urlkey&limit=10000" -o cdx.txt
           wc -l cdx.txt
-          echo "---- sample ----"
-          head -50 cdx.txt
-      - name: Commit result
-        run: |
-          git config user.name "wayback-bot"
-          git config user.email "bot@users.noreply.github.com"
-          git add cdx.txt
-          git commit -m "CDX index of zplusdesign.com" || echo "nothing to commit"
-          git push
+          mkdir -p pages
+          python3 - <<'PY'
+          import subprocess, os, time, json, re
+          from html.parser import HTMLParser
+          rows=[]
+          for line in open('cdx.txt',encoding='utf-8',errors='ignore'):
+              p=line.strip().split()
+              if len(p)>=4 and p[2]=='200' and 'text/html' in p[3]:
+                  rows.append((p[0],p[1]))
+          print('targets:',len(rows))
+          class T(HTMLParser):
+              def __init__(self):
+                  super().__init__(); self.title=[]; self.int=0; self.txt=[]
+              def handle_starttag(self,t,a):
+                  if t=='title': self.int=1
+                  if t in ('script','style'): self.int=2
+              def handle_endtag(self,t):
+                  if t=='title': self.int=0
+                  if t in ('script','style'): self.int=0
+              def handle_data(self,d):
+                  if self.int==0: self.txt.append(d.strip())
+                  elif self.int==1: self.title.append(d.strip())
+          out=open('summaries.jsonl','w',encoding='utf-8')
+          for i,(url,ts) in enumerate(rows):
+              try:
+                  r=subprocess.run(['curl','-s','--max-time','60','-L',
+                                    f'https://web.archive.org/web/{ts}id_/{url}'],
+                                   capture_output=True,timeout=70)
+                  raw=r.stdout.decode('utf-8','ignore')
+                  fn=f'pages/{i:04d}.html'
+                  open(fn,'w',encoding='utf-8').write(raw)
+                  p=T(); p.feed(raw)
+                  txt=' '.join([x for x in p.txt if x])
+                  txt=re.sub(r'\s+',' ',txt)
+                  title=' '.join(p.title)
+                  out.write(json.dumps({'i':i,'url':url,'ts':ts,'title':title[:200],'len':len(txt)},ensure_ascii=False)+'\n')
+                  time.sleep(0.4)
+              except Exception as e:
+                  print('ERR',url,e)
+          out.close()
+          print('done')
+          PY
+      - name: Upload pages
+        uses: actions/upload-artifact@v4
+        with:
+          name: pages
+          path: |
+            pages/
+            summaries.jsonl
+            cdx.txt
