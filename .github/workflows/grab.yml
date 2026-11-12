@@ -5,13 +5,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch CDX + all html snapshots
+      - name: Fetch CDX + all html snapshots with retries
         run: |
           curl -s --max-time 300 "https://web.archive.org/cdx/search/cdx?url=zplusdesign.com&matchType=domain&fl=original,timestamp,statuscode,mimetype&collapse=urlkey&limit=10000" -o cdx.txt
           wc -l cdx.txt
           mkdir -p pages
           python3 - <<'PY'
-          import subprocess, os, time, json, re
+          import subprocess, time, json, re
           from html.parser import HTMLParser
           rows=[]
           for line in open('cdx.txt',encoding='utf-8',errors='ignore'):
@@ -31,30 +31,43 @@ jobs:
               def handle_data(self,d):
                   if self.int==0: self.txt.append(d.strip())
                   elif self.int==1: self.title.append(d.strip())
+          def fetch(url):
+              for variant in [url, url.replace('http://zplusdesign.com','https://zplusdesign.com').replace('http://www.zplusdesign.com','https://www.zplusdesign.com'), url.replace(':80','')]:
+                  w=f'https://web.archive.org/web/{ts}id_/{variant}'
+                  r=subprocess.run(['curl','-s','--compressed','--max-time','60','-L','-w','__CODE__%{http_code}__%{size_download}',w],capture_output=True,timeout=70)
+                  out=r.stdout.decode('utf-8','ignore')
+                  m=re.search(r'__CODE__(\d+)__(\d+)$',out)
+                  code=m.group(1) if m else '???'
+                  body=re.sub(r'__CODE__\d+__\d+$','',out)
+                  if len(body)>100: return code,body
+                  time.sleep(0.3)
+              return code,body
           out=open('summaries.jsonl','w',encoding='utf-8')
+          diag=open('diag.txt','w',encoding='utf-8')
           for i,(url,ts) in enumerate(rows):
-              try:
-                  r=subprocess.run(['curl','-s','--max-time','60','-L',
-                                    f'https://web.archive.org/web/{ts}id_/{url}'],
-                                   capture_output=True,timeout=70)
-                  raw=r.stdout.decode('utf-8','ignore')
-                  fn=f'pages/{i:04d}.html'
-                  open(fn,'w',encoding='utf-8').write(raw)
-                  p=T(); p.feed(raw)
-                  txt=' '.join([x for x in p.txt if x])
-                  txt=re.sub(r'\s+',' ',txt)
-                  title=' '.join(p.title)
-                  out.write(json.dumps({'i':i,'url':url,'ts':ts,'title':title[:200],'len':len(txt)},ensure_ascii=False)+'\n')
-                  time.sleep(0.4)
-              except Exception as e:
-                  print('ERR',url,e)
-          out.close()
+              code,body=fetch(url)
+              open(f'pages/{i:04d}.html','w',encoding='utf-8').write(body)
+              p=T(); p.feed(body)
+              txt=' '.join([x for x in p.txt if x]); txt=re.sub(r'\s+',' ',txt)
+              title=' '.join(p.title)
+              out.write(json.dumps({'i':i,'url':url,'ts':ts,'code':code,'title':title[:200],'len':len(txt)},ensure_ascii=False)+'\n')
+              if i<8: diag.write(f'{i} {code} {len(body)} {url}\n')
+              time.sleep(0.3)
+          out.close(); diag.close()
           print('done')
           PY
+          head -30 diag.txt
+          python3 -c "
+          import json
+          rows=[json.loads(l) for l in open('summaries.jsonl',encoding='utf-8')]
+          nonz=[r for r in rows if r['len']>0]
+          print('nonzero:',len(nonz),'of',len(rows))
+          for r in nonz[:25]: print(r['ts'][:8], r['title'][:60])
+          "
       - name: Upload pages
         uses: actions/upload-artifact@v4
         with:
-          name: pages
+          name: pages2
           path: |
             pages/
             summaries.jsonl
